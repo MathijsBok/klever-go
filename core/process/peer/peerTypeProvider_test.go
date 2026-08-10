@@ -1,6 +1,7 @@
 package peer
 
 import (
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -84,7 +85,7 @@ func TestPeerTypeProvider_UpdateCache(t *testing.T) {
 		mutCache:         sync.RWMutex{},
 	}
 
-	ptp.updateCache(0)
+	ptp.UpdateCache(0)
 
 	assert.NotNil(t, ptp.cache)
 	assert.Equal(t, len(elected), len(ptp.cache))
@@ -120,8 +121,9 @@ func TestNewPeerTypeProvider_createCache(t *testing.T) {
 		mutCache:         sync.RWMutex{},
 	}
 
-	cache := ptp.createNewCache(0)
+	cache, ok := ptp.createNewCache(0)
 
+	require.True(t, ok)
 	assert.NotNil(t, cache)
 
 	assert.NotNil(t, cache[pkElected])
@@ -274,8 +276,9 @@ func TestPeerTypeProvider_CreateNewCacheScenarios(t *testing.T) {
 	}
 	ptp, _ := NewPeerTypeProvider(arg)
 
-	cache := ptp.createNewCache(0)
-	assert.Len(t, cache, 3)
+	cache, ok := ptp.createNewCache(0)
+	require.True(t, ok)
+	require.Len(t, cache, 3)
 	assert.Equal(t, core.EligibleList, cache["elected1"].pType) // elected1 is also eligible as it have been updated in the eligible list
 	assert.Equal(t, core.ElectedList, cache["elected2"].pType)
 	assert.Equal(t, core.EligibleList, cache["eligible1"].pType)
@@ -316,4 +319,144 @@ func TestPeerTypeProvider_GetAllPeerTypeInfos(t *testing.T) {
 	ptp.cache = make(map[string]*peerListAndShard)
 	emptyPeerTypeInfos := ptp.GetAllPeerTypeInfos()
 	assert.Empty(t, emptyPeerTypeInfos, "Should return empty slice for empty cache")
+}
+
+func TestPeerTypeProvider_UpdateCache_KeepsPreviousOnFailure(t *testing.T) {
+	t.Parallel()
+
+	arg := createDefaultArgPeerTypeProvider()
+	arg.NodesCoordinator = &mock.NodesCoordinatorMock{
+		GetAllWaitingValidatorsKeysCalled: func() ([][]byte, error) {
+			return [][]byte{[]byte("waiting1")}, nil
+		},
+		GetAllElectedValidatorsKeysCalled: func() ([][]byte, error) {
+			return [][]byte{[]byte("elected1")}, nil
+		},
+		GetAllEligibleValidatorsKeysCalled: func() ([][]byte, error) {
+			return [][]byte{[]byte("eligible1")}, nil
+		},
+	}
+
+	ptp := PeerTypeProvider{
+		nodesCoordinator: arg.NodesCoordinator,
+		cache:            nil,
+		mutCache:         sync.RWMutex{},
+	}
+
+	ptp.UpdateCache(0)
+	require.Len(t, ptp.cache, 3)
+
+	ptp.nodesCoordinator = &mock.NodesCoordinatorMock{
+		GetAllWaitingValidatorsKeysCalled: func() ([][]byte, error) {
+			return nil, fmt.Errorf("epoch config does not exist")
+		},
+	}
+
+	ptp.UpdateCache(99)
+
+	require.Len(t, ptp.cache, 3)
+	require.Contains(t, ptp.cache, "waiting1")
+	require.Contains(t, ptp.cache, "elected1")
+	require.Contains(t, ptp.cache, "eligible1")
+	assert.Equal(t, core.WaitingList, ptp.cache["waiting1"].pType)
+	assert.Equal(t, core.ElectedList, ptp.cache["elected1"].pType)
+	assert.Equal(t, core.EligibleList, ptp.cache["eligible1"].pType)
+}
+
+func TestPeerTypeProvider_CreateNewCache_FailsOnAnyGetterError(t *testing.T) {
+	t.Parallel()
+
+	okGetter := func() ([][]byte, error) {
+		return [][]byte{[]byte("pk1")}, nil
+	}
+	failingGetter := func() ([][]byte, error) {
+		return nil, fmt.Errorf("list unavailable")
+	}
+
+	testCases := []struct {
+		name        string
+		coordinator *mock.NodesCoordinatorMock
+	}{
+		{
+			name: "waiting getter fails",
+			coordinator: &mock.NodesCoordinatorMock{
+				GetAllWaitingValidatorsKeysCalled:  failingGetter,
+				GetAllElectedValidatorsKeysCalled:  okGetter,
+				GetAllEligibleValidatorsKeysCalled: okGetter,
+			},
+		},
+		{
+			name: "elected getter fails",
+			coordinator: &mock.NodesCoordinatorMock{
+				GetAllWaitingValidatorsKeysCalled:  okGetter,
+				GetAllElectedValidatorsKeysCalled:  failingGetter,
+				GetAllEligibleValidatorsKeysCalled: okGetter,
+			},
+		},
+		{
+			name: "eligible getter fails",
+			coordinator: &mock.NodesCoordinatorMock{
+				GetAllWaitingValidatorsKeysCalled:  okGetter,
+				GetAllElectedValidatorsKeysCalled:  okGetter,
+				GetAllEligibleValidatorsKeysCalled: failingGetter,
+			},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			ptp := PeerTypeProvider{
+				nodesCoordinator: tc.coordinator,
+				cache:            nil,
+				mutCache:         sync.RWMutex{},
+			}
+
+			cache, ok := ptp.createNewCache(0)
+
+			assert.False(t, ok)
+			assert.Nil(t, cache)
+		})
+	}
+}
+
+func TestPeerTypeProvider_ComputeForPubKey_PartitionScenarios(t *testing.T) {
+	t.Parallel()
+
+	arg := createDefaultArgPeerTypeProvider()
+	arg.NodesCoordinator = &mock.NodesCoordinatorMock{
+		GetAllWaitingValidatorsKeysCalled: func() ([][]byte, error) {
+			return [][]byte{[]byte("waiting1")}, nil
+		},
+		GetAllElectedValidatorsKeysCalled: func() ([][]byte, error) {
+			return [][]byte{[]byte("elected1")}, nil
+		},
+		GetAllEligibleValidatorsKeysCalled: func() ([][]byte, error) {
+			return [][]byte{[]byte("eligible1")}, nil
+		},
+	}
+
+	ptp, err := NewPeerTypeProvider(arg)
+	require.Nil(t, err)
+
+	// a key can only be in one of the three lists in production
+	// (computeNodesConfigFromList partitions on validatorInfo.List),
+	// so the scenarios cover the partition, not overlap states
+	testCases := []struct {
+		name         string
+		pubKey       string
+		expectedType core.PeerType
+	}{
+		{name: "key in waiting list resolves to waiting", pubKey: "waiting1", expectedType: core.WaitingList},
+		{name: "key in elected list resolves to elected", pubKey: "elected1", expectedType: core.ElectedList},
+		{name: "key in eligible list resolves to eligible", pubKey: "eligible1", expectedType: core.EligibleList},
+		{name: "key in no list resolves to observer", pubKey: "unknown1", expectedType: core.ObserverList},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			peerType, _, err := ptp.ComputeForPubKey([]byte(tc.pubKey))
+			assert.Nil(t, err)
+			assert.Equal(t, tc.expectedType, peerType)
+		})
+	}
 }
